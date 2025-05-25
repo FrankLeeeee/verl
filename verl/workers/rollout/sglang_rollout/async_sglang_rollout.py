@@ -101,7 +101,8 @@ class AsyncSGLangRollout(BaseRollout):
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
-        assert tensor_parallel_size <= dist.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        pipeline_paralle_size = self.config.get("pipeline_model_parallel_size", 1)
+        assert tensor_parallel_size * pipeline_paralle_size <= dist.get_world_size(), "tensor parallel size should be less than or equal to the world size"
 
         if kwargs.get("train_tp", None) is not None:
             # deployed with megatron
@@ -124,12 +125,14 @@ class AsyncSGLangRollout(BaseRollout):
             self.config.multi_turn.max_turns = self.config.max_model_len // 3
 
         tp_size = tensor_parallel_size
+        pp_size = pipeline_paralle_size
         world_size = int(os.getenv("WORLD_SIZE", "-1"))
 
         # init device mesh
         if self._device_mesh_cpu is None:
+            dp_size = world_size // tp_size // pp_size
             device_mesh_kwargs = dict(
-                mesh_shape=(world_size // tp_size, tp_size, 1),
+                mesh_shape=(dp_size, tp_size, pp_size),
                 mesh_dim_names=["dp", "tp", "pp"],
             )
 
@@ -138,24 +141,29 @@ class AsyncSGLangRollout(BaseRollout):
         self._rank = self._device_mesh_cpu.get_rank()
         self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
         self._tp_size = self._device_mesh_cpu["tp"].size()
+        self._pp_rank = self._device_mesh_cpu["pp"].get_local_rank()
+        self._pp_size = self._device_mesh_cpu["pp"].size()
+
+        # create a model parallel group
+        self._mp_device_mesh_cpu = init_device_mesh("cpu", mesh_shape=(dp_size, tp_size * pipeline_paralle_size), mesh_dim_names=["dp", "mp"])
 
         # get tp_rank of this process in this tp group
-        visible_devices = [None] * self._device_mesh_cpu.size(1)
+        visible_devices = [None] * self._mp_device_mesh_cpu.size(1)
 
-        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp"))
+        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._mp_device_mesh_cpu['mp'].get_group())
         visible_devices_set = set(",".join(visible_devices).split(","))
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
 
         # initialize the inference engine
-        nnodes = -(-tp_size // len(visible_devices_set))
+        nnodes = tp_size * pp_size // len(visible_devices_set)
         if nnodes > 1:
             ip = get_ip()
             port = get_open_port() if port is None else port
             [ip, port] = broadcast_pyobj(
                 [ip, port],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu.get_group("tp"),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._mp_device_mesh_cpu.get_group("mp"),
+                src=self._mp_device_mesh_cpu["mp"].mesh[0].item(),
                 force_cpu_device=False,
             )
             dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
@@ -163,9 +171,9 @@ class AsyncSGLangRollout(BaseRollout):
             dist_init_addr = None
 
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
-        tp_size_per_node = self._tp_size // nnodes
-        node_rank = self._tp_rank // tp_size_per_node
-        first_rank_in_node = self._tp_rank % tp_size_per_node == 0
+        num_gpus_per_node = len(visible_devices_set)
+        node_rank = self._mp_device_mesh_cpu.get_rank() // num_gpus_per_node
+        first_rank_in_node = self._mp_device_mesh_cpu.get_rank() % num_gpus_per_node == 0
 
         if first_rank_in_node:
             rank = dist.get_rank()
@@ -178,6 +186,7 @@ class AsyncSGLangRollout(BaseRollout):
                 base_gpu_id=0,
                 gpu_id_step=1,
                 tp_size=self._tp_size,
+                pp_size=self._pp_size,
                 node_rank=node_rank,
                 load_format=load_format,
                 dist_init_addr=dist_init_addr,
