@@ -182,8 +182,14 @@ class FSDPAsyncSGLangShardingManager(FSDPSGLangShardingManager):
     ):
         super().__init__(module, inference_engine, model_config, full_params, device_mesh, offload_param)
 
+    def _is_mp_rank_0(self):
+        return self.device_mesh["infer_tp"].get_local_rank() == 0 and self.device_mesh["pp"].get_local_rank() == 0
+    
+    def _is_tp_rank_0(self):
+        return self.device_mesh["infer_tp"].get_local_rank() == 0
+
     def update_weights(self, params):
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+        if self.inference_engine:
             self.inference_engine.resume_memory_occupation()
 
         # Most naive implementation, can optimize a lot if it is bottleneck from sglang Engine weight update
@@ -192,7 +198,7 @@ class FSDPAsyncSGLangShardingManager(FSDPSGLangShardingManager):
         for tensor_index, (name, tensor) in enumerate(named_tensors):
             serialized_tensor = MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor))
 
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            if self._is_tp_rank_0():
                 gathered_serialized_tensors = [None for _ in range(self.device_mesh["infer_tp"].mesh.size()[0])]
             else:
                 gathered_serialized_tensors = None
@@ -203,7 +209,7 @@ class FSDPAsyncSGLangShardingManager(FSDPSGLangShardingManager):
                 group=self.device_mesh["infer_tp"].get_group(),
             )
 
-            if self.device_mesh["infer_tp"].get_local_rank() == 0:
+            if self.inference_engine:
                 self.inference_engine.update_weights_from_tensor(
                     named_tensors=[
                         (
@@ -216,5 +222,5 @@ class FSDPAsyncSGLangShardingManager(FSDPSGLangShardingManager):
                 )
 
     def release_memory(self):
-        if self.device_mesh["infer_tp"].get_local_rank() == 0:
+        if self.inference_engine:
             self.inference_engine.release_memory_occupation()

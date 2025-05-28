@@ -28,7 +28,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.openai_api.protocol import Tool
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import get_ip, get_open_port
@@ -146,6 +146,9 @@ class AsyncSGLangRollout(BaseRollout):
 
         # create a model parallel group
         self._mp_device_mesh_cpu = init_device_mesh("cpu", mesh_shape=(dp_size, tp_size * pipeline_paralle_size), mesh_dim_names=["dp", "mp"])
+        self._mp_rank = self._mp_device_mesh_cpu['mp'].get_local_rank()
+        self._mp_size = self._mp_device_mesh_cpu['mp'].size()
+        self._mp_group = self._mp_device_mesh_cpu['mp'].get_group()
 
         # get tp_rank of this process in this tp group
         visible_devices = [None] * self._mp_device_mesh_cpu.size(1)
@@ -177,7 +180,7 @@ class AsyncSGLangRollout(BaseRollout):
 
         if first_rank_in_node:
             rank = dist.get_rank()
-            os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+            # os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
             self._engine = Engine(
                 model_path=actor_module,
                 dtype=config.dtype,
@@ -207,7 +210,7 @@ class AsyncSGLangRollout(BaseRollout):
             self._engine = None
 
         # offload
-        if self._tp_rank == 0:
+        if self._engine:
             self._engine.release_memory_occupation()
 
         kwargs = dict(
@@ -371,11 +374,9 @@ class AsyncSGLangRollout(BaseRollout):
                 temperature=self.config.val_kwargs.temperature,
                 n=1,  # if validate, already repeat in ray_trainer
             )
-
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            print(f"{self.sampling_params=}")
-            if self._tp_rank == 0:
+            if self._engine:
                 loop = asyncio.get_event_loop()
                 output = loop.run_until_complete(
                     self._engine.async_generate(
@@ -388,12 +389,15 @@ class AsyncSGLangRollout(BaseRollout):
                 )
             else:
                 output = None
+
+            dist.barrier()
+
             # Most naive implementation, can extract tensor and send via gloo if too slow
             [output] = broadcast_pyobj(
                 data=[output],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu["tp"].get_group(),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._mp_group,
+                src=self._mp_device_mesh_cpu["mp"].mesh[0].item(),
                 force_cpu_device=False,
             )
             out = _post_process_outputs(self.tokenizer, output)
@@ -597,7 +601,7 @@ class AsyncSGLangRollout(BaseRollout):
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         tgt_device = prompts.batch["input_ids"].device
-        if self._tp_rank == 0:
+        if self._engine:
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
                 n=1 if is_validate else self.config.n,
@@ -703,7 +707,7 @@ class AsyncSGLangRollout(BaseRollout):
         )
 
         # free cache engine
-        if self.config.free_cache_engine and self._engine is not None and self._tp_rank == 0:
+        if self.config.free_cache_engine and self._engine is not None:
             self._engine.flush_cache()
 
         return DataProto(batch=batch, non_tensor_batch={"messages": np.array(messages), "reward_scores": np.array(reward_scores)})

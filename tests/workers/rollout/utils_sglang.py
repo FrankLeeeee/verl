@@ -120,7 +120,7 @@ def generate_hf_output(model, input_ids, attention_mask, tokenizer, max_response
     return tokenizer.batch_decode(response)
 
 
-def get_rollout_config(max_response_length, max_prompt_length, dtype, tensor_parallel_size):
+def get_rollout_config(max_response_length, max_prompt_length, dtype, tensor_parallel_size, pipeline_parallel_size=1):
     sampling_params = dict(
         n=1,
         temperature=0,
@@ -148,6 +148,7 @@ def get_rollout_config(max_response_length, max_prompt_length, dtype, tensor_par
             "prompt_length": max_prompt_length,
             "response_length": max_response_length,
             "tensor_model_parallel_size": tensor_parallel_size,
+            "pipeline_model_parallel_size": pipeline_parallel_size,
             "multi_turn": {
                 "max_turns": 4,
                 "enable": True,
