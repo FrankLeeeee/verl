@@ -245,9 +245,17 @@ class DataParallelPPOActor(BasePPOActor):
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+            if isinstance(self.actor_optimizer, tuple):
+                for optimizer in self.actor_optimizer:
+                    optimizer.zero_grad()
+            else:
+                self.actor_optimizer.zero_grad()
         else:
-            self.actor_optimizer.step()
+            if isinstance(self.actor_optimizer, tuple):
+                for optimizer in self.actor_optimizer:
+                    optimizer.step()
+            else:
+                self.actor_optimizer.step()
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -356,7 +364,11 @@ class DataParallelPPOActor(BasePPOActor):
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                if isinstance(self.actor_optimizer, tuple):
+                    for optimizer in self.actor_optimizer:
+                        optimizer.zero_grad()
+                else:
+                    self.actor_optimizer.zero_grad()
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -436,5 +448,11 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
-        self.actor_optimizer.zero_grad()
+
+        if isinstance(self.actor_optimizer, tuple): 
+            for optimizer in self.actor_optimizer:
+                optimizer.zero_grad()
+        else:
+            self.actor_optimizer.zero_grad()
+
         return metrics

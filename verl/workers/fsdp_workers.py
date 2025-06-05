@@ -71,10 +71,115 @@ from dataclasses import asdict
 import json
 
 
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+# ===============================
+# Muon optimizer
+# ===============================
+from torch import Tensor
+
+@torch.compile
+def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    https://kellerjordan.github.io/posts/muon/
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer should not be used for the embedding layer, the final fully connected layer,
+    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        ns_steps: The number of Newton-Schulz iteration steps to use.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+        self.rank = rank
+        self.world_size = world_size
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        params: list[Tensor] = [*params]
+        param_groups = []
+        for size in {p.numel() for p in params}:
+            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            group = dict(params=[p for p in params if p.numel() == size],
+                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+            param_groups.append(group)
+        super().__init__(param_groups, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            update_buffer: Tensor = group["update_buffer"]
+            update_buffer_views: list[Tensor] = group["update_buffer_views"]
+            # generate weight updates in distributed fashion
+            params: list[Tensor] = group["params"]
+            handle = None
+            params_world = None
+            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                handle.wait()
+                for p_world, g_world in zip(params_world, update_buffer_views):
+                    p_world.add_(g_world.view_as(p_world),
+                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
+            for base_i in range(len(params))[::self.world_size]:
+                if base_i + self.rank < len(params):
+                    p = params[base_i + self.rank]
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(g, 1 - group["momentum"])
+                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                else:
+                    g = update_buffer_views[self.rank]
+                if base_i > 0:
+                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                params_world = params[base_i : base_i + self.world_size]
+            update_prev()
+
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -302,7 +407,8 @@ class ActorRolloutRefWorker(Worker):
             print(f"wrap_policy: {auto_wrap_policy}")
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        # sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        sharding_strategy = ShardingStrategy.NO_SHARD
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -355,12 +461,29 @@ class ActorRolloutRefWorker(Worker):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
+            # collect the parameters to optimize
+            embed_params = []
+            scalar_params = []
+            head_params = []
+            hidden_matrix_params = []
+            for name, param in actor_module_fsdp.named_parameters():
+                if "embed" in name:
+                    embed_params.append(param)
+                elif "lm_head" in name:
+                    head_params.append(param)
+                elif param.ndim < 2:
+                    scalar_params.append(param)
+                else:
+                    hidden_matrix_params.append(param)
+
+            actor_optimizer_1 = optim.AdamW(
+                # actor_module_fsdp.parameters(),
+                embed_params + scalar_params + head_params,
                 lr=optim_config.lr,
                 betas=optim_config.get("betas", (0.9, 0.999)),
                 weight_decay=optim_config.get("weight_decay", 1e-2),
             )
+            actor_optimizer_2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -375,9 +498,11 @@ class ActorRolloutRefWorker(Worker):
                 print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
 
             if warmup_style == "constant":
-                actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps)
+                actor_lr_scheduler_1 = get_constant_schedule_with_warmup(optimizer=actor_optimizer_1, num_warmup_steps=num_warmup_steps)
+                actor_lr_scheduler_2 = get_constant_schedule_with_warmup(optimizer=actor_optimizer_1, num_warmup_steps=num_warmup_steps)
             elif warmup_style == "cosine":
-                actor_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps, min_lr_ratio=min_lr_ratio, num_cycles=num_cycles)
+                actor_lr_scheduler_1 = get_cosine_schedule_with_warmup(optimizer=actor_optimizer_1, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps, min_lr_ratio=min_lr_ratio, num_cycles=num_cycles)
+                actor_lr_scheduler_2 = get_cosine_schedule_with_warmup(optimizer=actor_optimizer_2, num_warmup_steps=num_warmup_steps, num_training_steps=total_steps, min_lr_ratio=min_lr_ratio, num_cycles=num_cycles)
             else:
                 raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
 
@@ -386,7 +511,7 @@ class ActorRolloutRefWorker(Worker):
             actor_optimizer = None
             actor_lr_scheduler = None
 
-        return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+        return actor_module_fsdp, (actor_optimizer_1, actor_optimizer_2), (actor_lr_scheduler_1, actor_lr_scheduler_2), actor_model_config
 
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
@@ -586,8 +711,8 @@ class ActorRolloutRefWorker(Worker):
             self.flops_counter = FlopsCounter(self.actor_model_config)
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
+                optimizer=self.actor.actor_optimizer[0] if isinstance(self.actor.actor_optimizer, tuple) else self.actor.actor_optimizer,
+                lr_scheduler=self.actor_lr_scheduler[0] if isinstance(self.actor_lr_scheduler, tuple) else self.actor_lr_scheduler,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
@@ -616,9 +741,18 @@ class ActorRolloutRefWorker(Worker):
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+            if isinstance(self.actor_lr_scheduler, tuple):
+                lr = self.actor_lr_scheduler[0].get_last_lr()[0]
+                metrics["actor/lr"] = lr
+            else:
+                lr = self.actor_lr_scheduler.get_last_lr()[0]
+                metrics["actor/lr"] = lr
+
+            if isinstance(self.actor_lr_scheduler, tuple):
+                for lr_scheduler in self.actor_lr_scheduler:
+                    lr_scheduler.step()
+            else:
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
